@@ -19,8 +19,9 @@ show.
 2. Show me the current state: `~/dev/recall/bin/recall status`.
 3. Initialise: `~/dev/recall/bin/recall init --dir ~/.claude/memory`. This merges one key,
    autoMemoryDirectory, into my user settings and leaves every other key as it was; confirm that
-   by showing `python3 -c 'import json;print(sorted(json.load(open("$HOME/.claude/settings.json".replace("$HOME",__import__("os").path.expanduser("~"))))))'`
-   before and after.
+   by running `~/dev/recall/bin/recall status` before and after, and by showing the key list of
+   the settings file before and after with
+   `python3 -c 'import json,os; p=os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude")), "settings.json"); print(sorted(json.load(open(p))) if os.path.exists(p) else "no settings.json yet")'`.
 4. Dry run the migration: `~/dev/recall/bin/recall migrate --dry-run`. Paste the whole report.
    Point out any line that says rename, CONFLICT, dangling or skipped, and what it means.
 5. Migrate for real: `~/dev/recall/bin/recall migrate`. Then `~/dev/recall/bin/recall check` and

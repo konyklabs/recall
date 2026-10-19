@@ -31,7 +31,7 @@ Verified against the Claude Code docs on 2026-10-19: https://code.claude.com/doc
     indexed and every index line resolving, the index under the start-up load limit. It reports;
     it never rewrites a memory to satisfy itself.
   - `recall status`: where memory resolves to, counts, git state, how many per-project
-    directories still wait to be gathered.
+    directories exist (the dry run says what in them is new).
 - `docs/setup-prompt.md`: the paste-in prompt. A Claude Code session on a fresh machine runs the
   whole setup from it, dry run first.
 - `scripts/check.sh`: the repository's own check (tests, compile, actionlint when present).

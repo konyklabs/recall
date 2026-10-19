@@ -58,7 +58,7 @@ class MigrateTests(Fixture):
         self.assertIn("DRY RUN", out)
         self.assertIn("rename shared-fact.md -> dev-beta--shared-fact.md", out)
         self.assertIn("dangling (not carried): - [Gone](gone.md)", out)
-        self.assertFalse(self.target.exists() and any(self.target.iterdir()))
+        self.assertFalse(self.target.exists(), "a dry run must not even create the directory")
 
     def test_migrate_copies_renames_and_indexes(self):
         code, out = self.run_cli("migrate", "--dir", str(self.target))
@@ -116,6 +116,72 @@ class MigrateTests(Fixture):
         code, out = self.run_cli("check", "--dir", str(self.target))
         self.assertEqual(code, 1)
         self.assertIn("points at missing b.md", out)
+        self.assertIn("exceeds the start-up load", out)
+
+
+class ReviewFindingsTests(Fixture):
+    """Cases from the first review round (2026-10-19), each reproduced before the fix."""
+
+    def test_sibling_linking_to_a_renamed_file_stays_idempotent(self):
+        (self.b / "other.md").write_text(mem("other", "links to the renamed one", "see [[shared-fact]] and (shared-fact.md)"))
+        self.run_cli("migrate", "--dir", str(self.target))
+        other = (self.target / "other.md").read_text()
+        self.assertIn("[[dev-beta--shared-fact]]", other)
+        self.assertIn("(dev-beta--shared-fact.md)", other)
+        code, out = self.run_cli("migrate", "--dir", str(self.target))
+        self.assertEqual(code, 0, out)
+        self.assertIn("written: 0 files, 0 index sections", out)
+        self.assertFalse((self.target / "dev-beta--other.md").exists())
+
+    def test_crlf_and_odd_bytes_copy_byte_for_byte_and_dedupe(self):
+        body = b"---\r\nname: crlf\r\ndescription: windows file\r\nmetadata:\r\n  type: project\r\n---\r\n\r\n\xff raw byte\r\n"
+        (self.a / "crlf.md").write_bytes(body); (self.b / "crlf.md").write_bytes(body)
+        code, out = self.run_cli("migrate", "--dir", str(self.target))
+        self.assertEqual((self.target / "crlf.md").read_bytes(), body)
+        self.assertFalse((self.target / "dev-beta--crlf.md").exists(), out)
+        self.assertEqual((self.a / "crlf.md").read_bytes(), body)
+
+    def test_names_differing_only_in_case_do_not_overwrite(self):
+        (self.a / "Foo.md").write_text(mem("Foo", "upper", "A"))
+        (self.b / "foo.md").write_text(mem("foo", "lower", "B"))
+        code, out = self.run_cli("migrate", "--dir", str(self.target))
+        self.assertIn("rename foo.md -> dev-beta--foo.md", out)
+        self.assertIn("A", (self.target / "Foo.md").read_text())
+        self.assertIn("B", (self.target / "dev-beta--foo.md").read_text())
+
+    def test_wikilink_alias_and_heading_survive_rewrite(self):
+        self.assertEqual(recall.apply_rewrites("[[a|an apple]] [[a#top]] [[b]]", {"a": "s--a"}), "[[s--a|an apple]] [[s--a#top]] [[b]]")
+
+    def test_explicit_symlinked_source_is_skipped(self):
+        real = self.tmp / "real"; real.mkdir(); (real / "x.md").write_text(mem("x", "y"))
+        link = self.tmp / "link"; link.symlink_to(real)
+        code, out = self.run_cli("migrate", "--dir", str(self.target), "--dry-run", "--source", str(link))
+        self.assertIn("skipped (already relocated", out)
+        self.assertIn("nothing to migrate", out)
+
+    def test_checkbox_lines_are_prose_not_index_lines(self):
+        (self.b / "MEMORY.md").write_text("# i\n\n- [ ] a todo\n- [Same](same.md) — identical\n")
+        code, out = self.run_cli("migrate", "--dir", str(self.target), "--dry-run")
+        self.assertNotIn("dangling (not carried): - [ ]", out)
+        self.assertIn("1 prose line(s)", out)
+
+    def test_sources_untouched_byte_for_byte_and_check_never_rewrites(self):
+        before = {str(p): p.read_bytes() for d in (self.a, self.b) for p in d.glob("*.md")}
+        self.run_cli("migrate", "--dir", str(self.target))
+        (self.target / "odd.md").write_text("---\nname: odd\ndescription: d\nmetadata:\n  type: elsewhere\n---\nbody\n")
+        snapshot = {str(p): p.read_bytes() for p in self.target.glob("*.md")}
+        code, out = self.run_cli("check", "--dir", str(self.target))
+        self.assertEqual({str(p): p.read_bytes() for p in self.target.glob("*.md")}, snapshot)
+        self.assertEqual({str(p): p.read_bytes() for d in (self.a, self.b) for p in d.glob("*.md")}, before)
+        self.assertIn("odd.md: metadata.type is 'elsewhere'", out)
+        self.assertIn("odd.md: not in MEMORY.md", out)
+
+    def test_check_flags_index_over_byte_limit(self):
+        self.target.mkdir()
+        (self.target / "a.md").write_text(mem("a", "x"))
+        (self.target / "MEMORY.md").write_text("# i\n\n- [a](a.md) — " + "x" * (recall.INDEX_BYTE_LIMIT + 10) + "\n")
+        code, out = self.run_cli("check", "--dir", str(self.target))
+        self.assertEqual(code, 1)
         self.assertIn("exceeds the start-up load", out)
 
 

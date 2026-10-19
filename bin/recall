@@ -32,7 +32,9 @@ INDEX_LINE_LIMIT = 200        # lines of MEMORY.md loaded at session start (docs
 INDEX_BYTE_LIMIT = 25 * 1024  # bytes of MEMORY.md loaded at session start
 TYPES = {"user", "feedback", "project", "reference"}
 LINK_RE = re.compile(r"\]\(([^)\s]+\.md)\)")
-WIKI_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
+INDEX_LINE_RE = re.compile(r"^\s*- \[[^\]\s][^\]]*\]\([^)\s]+\.md\)")
+ENC = ("utf-8", "surrogateescape")  # byte-faithful text round trip
+WIKI_RE = re.compile(r"\[\[([^\]|#]+)([|#][^\]]*)?\]\]")
 FM_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
 
 
@@ -114,7 +116,15 @@ def memory_files(d: Path) -> list[Path]:
 
 
 def index_lines(text: str) -> list[str]:
-    return [ln for ln in text.splitlines() if ln.lstrip().startswith("- [")]
+    return [ln for ln in text.splitlines() if INDEX_LINE_RE.match(ln)]
+
+
+def decode(b: bytes) -> str:
+    return b.decode(*ENC)
+
+
+def encode(s: str) -> bytes:
+    return s.encode(*ENC)
 
 
 def line_target(line: str) -> str | None:
@@ -164,54 +174,73 @@ def cmd_init(a: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- migrate
 
-def plan_source(src: Path, target: Path, taken: dict[str, bytes]) -> dict:
+def plan_source(src: Path, target: Path, taken: dict[str, tuple[str, bytes]]) -> dict:
     """Decide, per file of one source: copy, rename (same name, different content),
     identical (already there, byte for byte, after this source's link rewrites) or
     conflict (a renamed copy exists and differs: left alone, reported). Pure: reads only.
-    `taken` maps every name present or planned in the target to the bytes it will hold."""
+    `taken` maps every lower-cased name present or planned in the target to the real name
+    and the exact bytes it will hold; names are compared case-insensitively because the
+    directory may sit on a case-insensitive filesystem."""
     label = source_label(src)
     slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "src"
     files = memory_files(src)
     raw = {f.name: f.read_bytes() for f in files}
-    text = {f.name: f.read_text(encoding="utf-8", errors="replace") for f in files}
-    # pass 1: a destination name per file, and the rename map for this source's links
+    text = {f.name: decode(raw[f.name]) for f in files}
+
+    def held(name: str) -> bytes | None:
+        hit = taken.get(name.lower())
+        return hit[1] if hit else None
+
+    # pass 1: rename what collides on raw bytes; then un-rename any file whose written form
+    # (links rewritten for the other renames) is already held, until nothing changes
+    rename: dict[str, str] = {f.stem: "" for f in files if held(f.name) is not None and held(f.name) != raw[f.name]}
+    while True:
+        settled = True
+        for f in files:
+            if f.stem in rename:
+                others = {k: v for k, v in rename.items() if k != f.stem}
+                probe = encode(apply_rewrites(text[f.name], _final(others, slug)))
+                if held(f.name) == probe:
+                    del rename[f.stem]
+                    settled = False
+        if settled:
+            break
+    rename = _final(rename, slug)
     dest: dict[str, str] = {}
-    rename: dict[str, str] = {}
+    planned_here: set[str] = set()
     for f in files:
-        if f.name not in taken or taken[f.name] == raw[f.name]:
+        if f.stem not in rename:
             dest[f.name] = f.name
             continue
-        new = f"{slug}--{f.name}"
+        new = f"{rename[f.stem]}.md"
         n = 2
         # a name planned by another source in this run (not yet on disk) with other content: bump;
         # a name already on disk is kept, and pass 2 calls it identical or conflict
-        while new in taken and taken[new] != raw[f.name] and not (target / new).exists():
+        while (new.lower() in taken and held(new) != raw[f.name] and not (target / new).exists()) or new.lower() in planned_here:
             new = f"{slug}-{n}--{f.name}"
+            rename[f.stem] = Path(new).stem
             n += 1
         dest[f.name] = new
-        rename[f.stem] = Path(new).stem
+        planned_here.add(new.lower())
     # pass 2: with the final rename map, decide what each destination gets
-    actions = []   # (src_path, dest_name, kind, rewritten_text)
+    actions = []   # (src_path, dest_name, kind, bytes_to_write)
     for f in files:
         d = dest[f.name]
-        rewritten = apply_rewrites(text[f.name], rename)
-        if d in taken:
-            if taken[d] in (raw[f.name], rewritten.encode("utf-8")):
-                kind = "identical"
-            else:
-                kind = "conflict"
+        out = encode(apply_rewrites(text[f.name], rename))
+        if d.lower() in taken:
+            kind = "identical" if held(d) == out else "conflict"
         else:
             kind = "copy" if d == f.name else "rename"
-            taken[d] = rewritten.encode("utf-8")
-        actions.append((f, d, kind, rewritten))
+            taken[d.lower()] = (d, out)
+        actions.append((f, d, kind, out))
     carried, dangling = [], []
     prose = 0
     idx = src / INDEX
     by_name = {f.name for f in files}
     indexed: set[str] = set()
     if idx.exists():
-        idx_text = idx.read_text(encoding="utf-8", errors="replace")
-        prose = sum(1 for ln in idx_text.splitlines() if ln.strip() and not ln.lstrip().startswith(("- [", "#")))
+        idx_text = decode(idx.read_bytes())
+        prose = sum(1 for ln in idx_text.splitlines() if ln.strip() and not INDEX_LINE_RE.match(ln) and not ln.lstrip().startswith("#"))
         for ln in index_lines(idx_text):
             t = line_target(ln)
             if t is None or Path(t).name not in by_name:
@@ -230,12 +259,17 @@ def plan_source(src: Path, target: Path, taken: dict[str, bytes]) -> dict:
             "carried": carried, "generated": generated, "dangling": dangling, "prose": prose}
 
 
+def _final(rename: dict[str, str], slug: str) -> dict[str, str]:
+    """Fill the planned new stem for every stem marked for rename."""
+    return {k: (v or f"{slug}--{k}") for k, v in rename.items()}
+
+
 def apply_rewrites(text: str, rename: dict[str, str]) -> str:
     if not rename:
         return text
     def wiki(m: re.Match) -> str:
         stem = m.group(1).strip()
-        return m.group(0).replace(stem, rename[stem]) if stem in rename else m.group(0)
+        return f"[[{rename[stem]}{m.group(2) or ''}]]" if stem in rename else m.group(0)
     text = WIKI_RE.sub(wiki, text)
     for old, new in rename.items():
         text = text.replace(f"({old}.md)", f"({new}.md)")
@@ -244,19 +278,18 @@ def apply_rewrites(text: str, rename: dict[str, str]) -> str:
 
 def cmd_migrate(a: argparse.Namespace) -> int:
     target = resolve_dir(a.dir)
-    sources = [Path(s).expanduser().resolve() for s in a.source] if a.source else default_sources()
+    sources = [Path(s).expanduser() for s in a.source] if a.source else default_sources()
     relocated = [s for s in sources if s.is_symlink()]
-    sources = [s for s in sources if s not in relocated and s.resolve() != target and memory_files(s)]
+    sources = [s.resolve() for s in sources if s not in relocated and s.resolve() != target and memory_files(s)]
     for s in relocated:
         print(f"skipped (already relocated by a project-scope setting; a symlink to {s.resolve()}): {s}")
     if not sources:
         print("recall: nothing to migrate (no per-project memory directories with files)")
         return 0
-    target.mkdir(parents=True, exist_ok=True)
     idx_path = target / INDEX
-    idx_text = idx_path.read_text(encoding="utf-8") if idx_path.exists() else "# Memory index\n\n"
+    idx_text = decode(idx_path.read_bytes()) if idx_path.exists() else "# Memory index\n\n"
     existing_lines = {ln.strip() for ln in index_lines(idx_text)}
-    taken = {p.name: p.read_bytes() for p in memory_files(target)}
+    taken = {p.name.lower(): (p.name, p.read_bytes()) for p in memory_files(target)} if target.is_dir() else {}
     plans = [plan_source(s, target, taken) for s in sources]
 
     mode = "DRY RUN, nothing written" if a.dry_run else "applied"
@@ -296,12 +329,13 @@ def cmd_migrate(a: argparse.Namespace) -> int:
         print("WARNING: the index would exceed what a session loads at start; prune or split after migrating")
     if a.dry_run:
         return 0
+    target.mkdir(parents=True, exist_ok=True)
     for p in plans:
-        for (s, d, k, rewritten) in p["actions"]:
+        for (s, d, k, out) in p["actions"]:
             if k in ("copy", "rename"):
-                (target / d).write_text(rewritten, encoding="utf-8")
+                (target / d).write_bytes(out)
     if additions:
-        idx_path.write_text(projected if projected.endswith("\n") else projected + "\n", encoding="utf-8")
+        idx_path.write_bytes(encode(projected if projected.endswith("\n") else projected + "\n"))
     print(f"written: {tot['copy'] + tot['rename']} files, {len(additions)} index sections; sources untouched")
     return 1 if tot["conflict"] else 0
 
@@ -383,8 +417,8 @@ def cmd_status(a: argparse.Namespace) -> int:
             print(f"git           {'clean' if n == 0 else f'{n} uncommitted change(s)'}")
         else:
             print("git           not a repository (recall init makes it one)")
-    srcs = [s for s in default_sources() if s != d and memory_files(s)]
-    print(f"per-project   {len(srcs)} director{'y' if len(srcs) == 1 else 'ies'} with files under {config_dir() / 'projects'} (recall migrate gathers them)")
+    srcs = [s for s in default_sources() if not s.is_symlink() and s.resolve() != d and memory_files(s)]
+    print(f"per-project   {len(srcs)} director{'y' if len(srcs) == 1 else 'ies'} with files under {config_dir() / 'projects'}, symlinked ones excluded (recall migrate --dry-run says what is new)")
     print("note          a project-scope autoMemoryDirectory in a repository's .claude/settings.json overrides the user scope there")
     return 0
 
