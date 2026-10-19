@@ -93,3 +93,7 @@ it only stops one person's sessions from forgetting what they were told.
 Branch per change, conventional-commit pull-request titles with a task reference, squash
 merges, `scripts/check.sh` green with its output in the pull-request body. The org's CI callers
 (title lint, proprietary-terms scan, on-demand review) run on pull requests.
+
+## License
+
+MIT. See `LICENSE`.
