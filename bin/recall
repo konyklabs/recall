@@ -17,8 +17,9 @@ Subcommands (stdlib only, Python 3.9+):
   unmount  NAME           the reverse
 
 DIR defaults to the autoMemoryDirectory in user settings, else ~/.claude/memory.
-Nothing here ever deletes or edits a source file. Memory content is never rewritten to
-satisfy the linter: a finding is reported for a person to settle.
+Nothing here deletes or edits a source memory file; `mount` and `unmount` edit only the marked
+block in the user CLAUDE.md and the symlinks under <DIR>/mounts/. Memory content is never
+rewritten to satisfy the linter: a finding is reported for a person to settle.
 """
 from __future__ import annotations
 

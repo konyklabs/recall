@@ -4,14 +4,20 @@ Paste the block below as the first message of a Claude Code session on the machi
 Start the session in your home directory or above your checkouts, not inside a repository that
 sets its own memory directory. The session needs `git` and `python3` (3.9 or newer).
 
-Everything it changes: one key in `~/.claude/settings.json`, a new directory with a git
-repository in it, and a checkout of this kit. It deletes nothing. Replace the directory path if
-you want the memory elsewhere.
+What it changes, all under your home directory: one key in `~/.claude/settings.json`; a new
+directory `~/.claude/memory` with a git repository in it; a checkout of this kit in `~/dev/recall`;
+and, only in step 9 and only for repositories you confirm, a marked block in `~/.claude/CLAUDE.md`
+plus symlinks inside the memory directory. Nothing is deleted from any repository or from the
+original per-project memory. Network: `git clone` and `git pull` from github.com, and two short
+`claude -p` model calls in step 7. Replace the directory path if you want the memory elsewhere.
+Check your employer's policy before gathering memory written while working in work repositories;
+that memory is personal notes about those repositories and lives in this one directory.
 
 ````
 Set up a shared Claude Code memory directory on this machine with the recall kit. Do these steps
 in order, show the command and its output for each, and stop at any step whose output you cannot
-show.
+show. Run nothing that is not listed here. The only network calls are the git clone or pull in
+step 1 and the two model calls in step 7. Do not install anything.
 
 1. Clone the kit: `git clone https://github.com/konyklabs/recall ~/dev/recall` (if the directory
    exists, `git -C ~/dev/recall pull --ff-only` instead). Run `~/dev/recall/scripts/check.sh` and
@@ -26,7 +32,8 @@ show.
    Point out any line that says rename, CONFLICT, dangling or skipped, and what it means.
 5. Migrate for real: `~/dev/recall/bin/recall migrate`. Then `~/dev/recall/bin/recall check` and
    paste its last line. Errors are findings for me, not for you to fix by editing memory files.
-6. Commit the memory directory: `git -C ~/.claude/memory add -A && git -C ~/.claude/memory commit -m "Gather this machine's auto memory"`.
+6. Commit the new memory directory (it was created in step 3, so `add -A` there touches nothing
+   else): `git -C ~/.claude/memory add -A && git -C ~/.claude/memory commit -m "Gather this machine's auto memory"`.
    Do not add a remote.
 7. Prove alignment: run `claude -p --model haiku "Without using any tool: what absolute path does
    your auto-memory context name, and how many index lines does it hold?"` from two different
@@ -40,16 +47,24 @@ show.
    the shared directory.
 
 9. If any repository on this machine keeps its own versioned memory (a project-scope
-   `autoMemoryDirectory` in its `.claude/settings.json`), list them and, for each I confirm, run
-   `~/dev/recall/bin/recall mount <that memory directory>` so its index loads in every session.
-   Show `~/dev/recall/bin/recall status` after, including the mount cost line.
-
-Optional, only if I say yes when you ask at the end, as one question: install Obsidian
-(`brew install --cask obsidian` on macOS) and open ~/.claude/memory as a vault; and install the
-capture plugin with `claude plugin marketplace add konyklabs/claude-plugins` then
-`claude plugin install supervisor@konyklabs-plugins`, and tell me `/supervisor:reflect` is how
-queued corrections become memory.
+   `autoMemoryDirectory` in its `.claude/settings.json`), list them and ask me which to mount. For
+   each I confirm, run `~/dev/recall/bin/recall mount <that memory directory>`. Say first what
+   it does: it writes a marked block into `~/.claude/CLAUDE.md` with an import line and a sentence
+   per mount, removes a bare duplicate import line of the same path if one exists outside the
+   block, adds a symlink under `~/.claude/memory/mounts/`, and adds `mounts/` to that directory's
+   `.gitignore`. Show `~/dev/recall/bin/recall status` after, including the mount cost line.
 ````
+
+## Optional, outside the prompt
+
+Both of these install software, so they are not in the paste-in block. Decide them yourself.
+
+- **Obsidian** (`brew install --cask obsidian` on macOS, or the download from obsidian.md): open
+  `~/.claude/memory` as a vault to browse the memory as a graph. Nothing in the kit needs it.
+- **Capture plugin:** a separate project, github.com/konyklabs/claude-plugins, has a Claude Code
+  plugin whose hooks queue the corrections you type and whose `/supervisor:reflect` command
+  writes the ones you accept as memory files. It installs code that runs as hooks in every
+  session; read its README first. The kit works without it.
 
 ## What to expect
 

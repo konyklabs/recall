@@ -11,9 +11,11 @@ so what a session learned in one checkout is unknown in the next.
 absolute path there routes every repository without its own override to the same directory. The
 directory's `MEMORY.md` index (first 200 lines or 25 KB) loads at every session start; topic
 files load on demand. Memory files are one fact per file with frontmatter and `[[wikilinks]]`,
-which is exactly the shape a markdown vault renders as a graph with backlinks and search.
+which Obsidian-style markdown vaults render as a graph with backlinks and search.
 
-Verified against the Claude Code docs on 2026-10-19: https://code.claude.com/docs/en/memory
+The behaviour described here was checked against that docs page on 2026-10-19; the docs may have changed since: https://code.claude.com/docs/en/memory
+
+You need Claude Code itself (a third-party tool; checked with version 2.1.303), `git` and Python 3.9 or newer.
 
 ## What is in the box
 
@@ -40,8 +42,9 @@ Verified against the Claude Code docs on 2026-10-19: https://code.claude.com/doc
     symlink under `<DIR>/mounts/` so the vault draws one graph, and a sentence telling sessions
     that facts about that repository are written to its directory. `recall unmount <name>`
     reverses it. `status` prints what the mounts cost per session; `check` covers them.
-    Measured 2026-10-19: a memory-only fact of a mounted repository was answered from a session
-    started in the parent folder and from an unrelated repository.
+    Observed once on 2026-10-19, in a manual run that is not part of the test suite: a memory-only
+    fact of a mounted repository was answered from a session started in the parent folder and
+    from an unrelated repository.
 - `docs/setup-prompt.md`: the paste-in prompt. A Claude Code session on a fresh machine runs the
   whole setup from it, dry run first.
 - `scripts/check.sh`: the repository's own check (tests, compile, actionlint when present).
@@ -67,18 +70,21 @@ Optional, after the above:
 - **Obsidian:** open `~/.claude/memory` as a vault ("Open folder as vault"). Graph view shows the
   `[[wikilinks]]`, backlinks show what cites a fact, search is full text. `.obsidian/` is ignored
   by the directory's `.gitignore` already.
-- **Capture:** the `supervisor` plugin from `konyklabs/claude-plugins` queues corrections and
-  "from now on" rules you type, and `/supervisor:reflect` turns the ones you accept into memory
-  files in this directory.
+- **Capture:** a separate project, github.com/konyklabs/claude-plugins (not part of this
+  repository), has a Claude Code plugin that queues the corrections you type and writes the ones
+  you accept as memory files here. It runs hooks in every session; read its README first. The kit
+  works without it.
 - **A private remote:** `git remote add origin <your private repository>` in the memory directory
-  carries it to a second machine. The kit never adds a remote.
+  carries it to a second machine. The kit never adds a remote. Memory written while working in
+  any repository is stored in this directory, so never push it to a public remote, and check your
+  employer's policy before gathering memory from work repositories.
 
 ## Sitting above the repositories
 
 A session loads the memory of the directory it starts in and no other, and a repository's
 `.claude/settings.json` is never inherited by a parent. Rules are fine: a nested `CLAUDE.md`
 loads on demand once the session touches a file in it. Memory is not, and a pointer injected at
-start-up is seen but not followed (measured). `recall mount` is the answer: the repository's
+start-up was seen but not followed in one manual trial. `recall mount` is the answer: the repository's
 index is imported into every session. The cost is that every mount loads at every start, so
 mount what is in play this month; `recall status` shows the total. Writes from a parent-rooted
 session still go to the shared directory; the block's sentence is the mitigation, not a redirect.
@@ -91,8 +97,10 @@ it only stops one person's sessions from forgetting what they were told.
 ## Rules of the repository
 
 Branch per change, conventional-commit pull-request titles with a task reference, squash
-merges, `scripts/check.sh` green with its output in the pull-request body. The org's CI callers
-(title lint, proprietary-terms scan, on-demand review) run on pull requests.
+merges, `scripts/check.sh` green with its output in the pull-request body. CI checks pull-request
+titles and scans for disallowed terms; reviews run on request. Those workflows call reusable
+workflows in the konyklabs organisation, so they do not run on forks; `scripts/check.sh` is the
+whole check and runs anywhere.
 
 ## License
 
