@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""recall: one Claude Code auto-memory directory for every repository on a machine.
+
+Subcommands (stdlib only, Python 3.9+):
+
+  init     --dir DIR     point user-scope autoMemoryDirectory at DIR, make DIR a git
+                         repository with an index and an ignore file; merges the one key
+                         into settings.json and touches nothing else there
+  migrate  --dir DIR     copy every per-project auto memory this machine holds
+                         (<config>/projects/*/memory/) into DIR; originals untouched;
+                         --dry-run prints the report and writes nothing
+  check    [--dir DIR]   lint DIR: frontmatter, index <-> file agreement, load limit
+  status   [--dir DIR]   where memory resolves to, counts, git state
+
+DIR defaults to the autoMemoryDirectory in user settings, else ~/.claude/memory.
+Nothing here ever deletes or edits a source file. Memory content is never rewritten to
+satisfy the linter: a finding is reported for a person to settle.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+INDEX = "MEMORY.md"
+INDEX_LINE_LIMIT = 200        # lines of MEMORY.md loaded at session start (docs, 2026-10-19)
+INDEX_BYTE_LIMIT = 25 * 1024  # bytes of MEMORY.md loaded at session start
+TYPES = {"user", "feedback", "project", "reference"}
+LINK_RE = re.compile(r"\]\(([^)\s]+\.md)\)")
+WIKI_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
+FM_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.S)
+
+
+# --------------------------------------------------------------------------- paths
+
+def config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+
+
+def settings_path() -> Path:
+    return config_dir() / "settings.json"
+
+
+def read_settings() -> dict:
+    p = settings_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"recall: {p} is not valid JSON ({e}); fix it by hand first")
+
+
+def default_dir() -> Path:
+    v = read_settings().get("autoMemoryDirectory")
+    return Path(v).expanduser() if v else config_dir() / "memory"
+
+
+def resolve_dir(arg: str | None) -> Path:
+    return (Path(arg).expanduser() if arg else default_dir()).resolve()
+
+
+def default_sources() -> list[Path]:
+    root = config_dir() / "projects"
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.glob("*/memory") if p.is_dir())
+
+
+def source_label(src: Path) -> str:
+    """The project key Claude Code wrote, minus the encoded home prefix."""
+    key = src.parent.name
+    home = "-" + str(Path.home()).strip("/").replace("/", "-") + "-"
+    if key.startswith(home):
+        key = key[len(home):]
+    return key.strip("-") or "root"
+
+
+# --------------------------------------------------------------------------- memory files
+
+def frontmatter(text: str) -> dict | None:
+    m = FM_RE.match(text)
+    if not m:
+        return None
+    out: dict = {}
+    parent = None
+    for raw in m.group(1).splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        key, sep, val = raw.strip().partition(":")
+        if not sep:
+            continue
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if indent == 0:
+            if val == "":
+                out[key] = {}
+                parent = key
+            else:
+                out[key] = val
+                parent = None
+        elif parent is not None and isinstance(out.get(parent), dict):
+            out[parent][key] = val
+    return out
+
+
+def memory_files(d: Path) -> list[Path]:
+    return sorted(p for p in d.glob("*.md") if p.name != INDEX)
+
+
+def index_lines(text: str) -> list[str]:
+    return [ln for ln in text.splitlines() if ln.lstrip().startswith("- [")]
+
+
+def line_target(line: str) -> str | None:
+    m = LINK_RE.search(line)
+    return m.group(1) if m else None
+
+
+def generated_line(path: Path) -> str:
+    fm = frontmatter(path.read_text(encoding="utf-8", errors="replace")) or {}
+    title = fm.get("name") or path.stem
+    desc = fm.get("description") or "(no description in frontmatter)"
+    return f"- [{title}]({path.name}) — {desc}"
+
+
+# --------------------------------------------------------------------------- init
+
+def cmd_init(a: argparse.Namespace) -> int:
+    d = resolve_dir(a.dir)
+    d.mkdir(parents=True, exist_ok=True)
+    idx = d / INDEX
+    if not idx.exists():
+        idx.write_text("# Memory index\n\n", encoding="utf-8")
+        print(f"created {idx}")
+    gi = d / ".gitignore"
+    wanted = [".obsidian/", ".trash/", ".DS_Store"]
+    have = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    missing = [w for w in wanted if w not in have]
+    if missing:
+        gi.write_text("\n".join(have + missing) + "\n", encoding="utf-8")
+        print(f"ignore file: added {', '.join(missing)}")
+    if not (d / ".git").exists():
+        subprocess.run(["git", "init", "-q", str(d)], check=True)
+        print(f"git: initialised {d}")
+    sp = settings_path()
+    s = read_settings()
+    if s.get("autoMemoryDirectory") == str(d):
+        print(f"settings: autoMemoryDirectory already {d}")
+    else:
+        prev = s.get("autoMemoryDirectory")
+        s["autoMemoryDirectory"] = str(d)
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(json.dumps(s, indent=2) + "\n", encoding="utf-8")
+        print(f"settings: autoMemoryDirectory {prev!r} -> {str(d)!r} in {sp} (other keys untouched)")
+    print("next: recall migrate --dry-run, then recall migrate; a new session picks the directory up")
+    return 0
+
+
+# --------------------------------------------------------------------------- migrate
+
+def plan_source(src: Path, target: Path, taken: dict[str, bytes]) -> dict:
+    """Decide, per file of one source: copy, rename (same name, different content),
+    identical (already there, byte for byte, after this source's link rewrites) or
+    conflict (a renamed copy exists and differs: left alone, reported). Pure: reads only.
+    `taken` maps every name present or planned in the target to the bytes it will hold."""
+    label = source_label(src)
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "src"
+    files = memory_files(src)
+    raw = {f.name: f.read_bytes() for f in files}
+    text = {f.name: f.read_text(encoding="utf-8", errors="replace") for f in files}
+    # pass 1: a destination name per file, and the rename map for this source's links
+    dest: dict[str, str] = {}
+    rename: dict[str, str] = {}
+    for f in files:
+        if f.name not in taken or taken[f.name] == raw[f.name]:
+            dest[f.name] = f.name
+            continue
+        new = f"{slug}--{f.name}"
+        n = 2
+        # a name planned by another source in this run (not yet on disk) with other content: bump;
+        # a name already on disk is kept, and pass 2 calls it identical or conflict
+        while new in taken and taken[new] != raw[f.name] and not (target / new).exists():
+            new = f"{slug}-{n}--{f.name}"
+            n += 1
+        dest[f.name] = new
+        rename[f.stem] = Path(new).stem
+    # pass 2: with the final rename map, decide what each destination gets
+    actions = []   # (src_path, dest_name, kind, rewritten_text)
+    for f in files:
+        d = dest[f.name]
+        rewritten = apply_rewrites(text[f.name], rename)
+        if d in taken:
+            if taken[d] in (raw[f.name], rewritten.encode("utf-8")):
+                kind = "identical"
+            else:
+                kind = "conflict"
+        else:
+            kind = "copy" if d == f.name else "rename"
+            taken[d] = rewritten.encode("utf-8")
+        actions.append((f, d, kind, rewritten))
+    carried, dangling = [], []
+    prose = 0
+    idx = src / INDEX
+    by_name = {f.name for f in files}
+    indexed: set[str] = set()
+    if idx.exists():
+        idx_text = idx.read_text(encoding="utf-8", errors="replace")
+        prose = sum(1 for ln in idx_text.splitlines() if ln.strip() and not ln.lstrip().startswith(("- [", "#")))
+        for ln in index_lines(idx_text):
+            t = line_target(ln)
+            if t is None or Path(t).name not in by_name:
+                dangling.append(ln.strip())
+                continue
+            indexed.add(Path(t).name)
+            newname = next(d for (s, d, k, _) in actions if s.name == Path(t).name)
+            carried.append(ln.strip().replace(f"({t})", f"({newname})"))
+    generated = []
+    for (s, d, k, _) in actions:
+        if s.name not in indexed and k != "conflict":
+            generated.append(generated_line(s).replace(f"({s.name})", f"({d})"))
+    carried = [ln for ln in carried
+               if not any(d == Path(line_target(ln)).name and k == "conflict" for (_, d, k, _) in actions)]
+    return {"src": src, "label": label, "actions": actions, "rename": rename,
+            "carried": carried, "generated": generated, "dangling": dangling, "prose": prose}
+
+
+def apply_rewrites(text: str, rename: dict[str, str]) -> str:
+    if not rename:
+        return text
+    def wiki(m: re.Match) -> str:
+        stem = m.group(1).strip()
+        return m.group(0).replace(stem, rename[stem]) if stem in rename else m.group(0)
+    text = WIKI_RE.sub(wiki, text)
+    for old, new in rename.items():
+        text = text.replace(f"({old}.md)", f"({new}.md)")
+    return text
+
+
+def cmd_migrate(a: argparse.Namespace) -> int:
+    target = resolve_dir(a.dir)
+    sources = [Path(s).expanduser().resolve() for s in a.source] if a.source else default_sources()
+    relocated = [s for s in sources if s.is_symlink()]
+    sources = [s for s in sources if s not in relocated and s.resolve() != target and memory_files(s)]
+    for s in relocated:
+        print(f"skipped (already relocated by a project-scope setting; a symlink to {s.resolve()}): {s}")
+    if not sources:
+        print("recall: nothing to migrate (no per-project memory directories with files)")
+        return 0
+    target.mkdir(parents=True, exist_ok=True)
+    idx_path = target / INDEX
+    idx_text = idx_path.read_text(encoding="utf-8") if idx_path.exists() else "# Memory index\n\n"
+    existing_lines = {ln.strip() for ln in index_lines(idx_text)}
+    taken = {p.name: p.read_bytes() for p in memory_files(target)}
+    plans = [plan_source(s, target, taken) for s in sources]
+
+    mode = "DRY RUN, nothing written" if a.dry_run else "applied"
+    print(f"recall migrate -> {target} ({mode})")
+    KINDS = ("copy", "rename", "identical", "conflict")
+    tot = {k: 0 for k in KINDS} | {"carried": 0, "generated": 0, "dangling": 0, "skipped_lines": 0}
+    additions: list[str] = []
+    for p in plans:
+        kinds = {k: sum(1 for (_, _, kk, _) in p["actions"] if kk == k) for k in KINDS}
+        new_lines = [ln for ln in p["carried"] + p["generated"] if ln not in existing_lines]
+        skipped = len(p["carried"]) + len(p["generated"]) - len(new_lines)
+        print(f"\n[{p['label']}]  {p['src']}")
+        print(f"  files {len(p['actions'])}: " + ", ".join(f"{k} {kinds[k]}" for k in KINDS))
+        for (s, d, k, _) in p["actions"]:
+            if k == "rename":
+                print(f"    rename {s.name} -> {d} (same name, different content, both kept)")
+            elif k == "conflict":
+                print(f"    CONFLICT {s.name}: {d} already exists with other content; left alone, not indexed")
+        print(f"  index: carried {len(p['carried'])}, generated {len(p['generated'])}, already present {skipped}, dangling {len(p['dangling'])}")
+        for ln in p["dangling"]:
+            print(f"    dangling (not carried): {ln}")
+        if p["prose"]:
+            print(f"    note: {p['prose']} prose line(s) in the source index are not link lines; not carried, the source keeps them")
+        for k in KINDS:
+            tot[k] += kinds[k]
+        tot["carried"] += len(p["carried"]); tot["generated"] += len(p["generated"])
+        tot["dangling"] += len(p["dangling"]); tot["skipped_lines"] += skipped
+        if new_lines:
+            additions.append(f"\n## From {p['label']}\n\n" + "\n".join(new_lines) + "\n")
+            existing_lines.update(new_lines)
+    projected = idx_text + "".join(additions)
+    n_lines = len(projected.splitlines()); n_bytes = len(projected.encode("utf-8"))
+    print(f"\ntotal: " + ", ".join(f"{k} {tot[k]}" for k in KINDS) + "; "
+          f"index lines carried {tot['carried']}, generated {tot['generated']}, already present {tot['skipped_lines']}, dangling {tot['dangling']}")
+    print(f"index after: {n_lines} lines, {n_bytes} bytes (loads at start up to {INDEX_LINE_LIMIT} lines / {INDEX_BYTE_LIMIT} bytes)")
+    if n_lines > INDEX_LINE_LIMIT or n_bytes > INDEX_BYTE_LIMIT:
+        print("WARNING: the index would exceed what a session loads at start; prune or split after migrating")
+    if a.dry_run:
+        return 0
+    for p in plans:
+        for (s, d, k, rewritten) in p["actions"]:
+            if k in ("copy", "rename"):
+                (target / d).write_text(rewritten, encoding="utf-8")
+    if additions:
+        idx_path.write_text(projected if projected.endswith("\n") else projected + "\n", encoding="utf-8")
+    print(f"written: {tot['copy'] + tot['rename']} files, {len(additions)} index sections; sources untouched")
+    return 1 if tot["conflict"] else 0
+
+
+# --------------------------------------------------------------------------- check
+
+def cmd_check(a: argparse.Namespace) -> int:
+    d = resolve_dir(a.dir)
+    if not d.is_dir():
+        print(f"recall check: {d} does not exist"); return 1
+    errors, warnings = [], []
+    files = memory_files(d)
+    stems = {f.stem for f in files}
+    for f in files:
+        text = f.read_text(encoding="utf-8", errors="replace")
+        fm = frontmatter(text)
+        if fm is None:
+            errors.append(f"{f.name}: no frontmatter"); continue
+        for key in ("name", "description"):
+            if not fm.get(key):
+                errors.append(f"{f.name}: frontmatter lacks {key}")
+        t = (fm.get("metadata") or {}).get("type") if isinstance(fm.get("metadata"), dict) else None
+        if t not in TYPES:
+            warnings.append(f"{f.name}: metadata.type is {t!r}, expected one of {sorted(TYPES)}")
+        for m in WIKI_RE.finditer(text):
+            if m.group(1).strip() not in stems:
+                warnings.append(f"{f.name}: [[{m.group(1).strip()}]] has no file yet")
+    idx = d / INDEX
+    if not idx.exists():
+        errors.append(f"{INDEX} missing")
+    else:
+        text = idx.read_text(encoding="utf-8")
+        lines = index_lines(text)
+        targets = []
+        for ln in lines:
+            t = line_target(ln)
+            if t is None:
+                errors.append(f"{INDEX}: no (file.md) link in: {ln.strip()[:80]}"); continue
+            targets.append(Path(t).name)
+            if not (d / Path(t).name).exists():
+                errors.append(f"{INDEX}: points at missing {t}")
+        seen = set()
+        for t in targets:
+            if t in seen:
+                warnings.append(f"{INDEX}: {t} indexed more than once")
+            seen.add(t)
+        for f in files:
+            if f.name not in seen:
+                errors.append(f"{f.name}: not in {INDEX}")
+        n_lines, n_bytes = len(text.splitlines()), len(text.encode("utf-8"))
+        if n_lines > INDEX_LINE_LIMIT or n_bytes > INDEX_BYTE_LIMIT:
+            errors.append(f"{INDEX}: {n_lines} lines / {n_bytes} bytes exceeds the start-up load ({INDEX_LINE_LIMIT} / {INDEX_BYTE_LIMIT})")
+        elif n_lines > 0.8 * INDEX_LINE_LIMIT or n_bytes > 0.8 * INDEX_BYTE_LIMIT:
+            warnings.append(f"{INDEX}: {n_lines} lines / {n_bytes} bytes, past 80% of the start-up load")
+    for e in errors:
+        print(f"ERROR   {e}")
+    for w in warnings:
+        print(f"warning {w}")
+    print(f"recall check {d}: {len(files)} files, {len(errors)} errors, {len(warnings)} warnings")
+    return 1 if errors else 0
+
+
+# --------------------------------------------------------------------------- status
+
+def cmd_status(a: argparse.Namespace) -> int:
+    d = resolve_dir(a.dir)
+    s = read_settings()
+    print(f"settings      {settings_path()}")
+    print(f"user scope    autoMemoryDirectory = {s.get('autoMemoryDirectory', '(unset: per-project default)')}")
+    print(f"directory     {d} ({'exists' if d.is_dir() else 'missing'})")
+    if d.is_dir():
+        files = memory_files(d)
+        idx = d / INDEX
+        text = idx.read_text(encoding="utf-8") if idx.exists() else ""
+        print(f"files         {len(files)}; index {len(text.splitlines())} lines, {len(text.encode('utf-8'))} bytes")
+        if (d / ".git").exists():
+            r = subprocess.run(["git", "-C", str(d), "status", "--short"], capture_output=True, text=True)
+            n = len([ln for ln in r.stdout.splitlines() if ln.strip()])
+            print(f"git           {'clean' if n == 0 else f'{n} uncommitted change(s)'}")
+        else:
+            print("git           not a repository (recall init makes it one)")
+    srcs = [s for s in default_sources() if s != d and memory_files(s)]
+    print(f"per-project   {len(srcs)} director{'y' if len(srcs) == 1 else 'ies'} with files under {config_dir() / 'projects'} (recall migrate gathers them)")
+    print("note          a project-scope autoMemoryDirectory in a repository's .claude/settings.json overrides the user scope there")
+    return 0
+
+
+# --------------------------------------------------------------------------- main
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="recall", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("init"); p.add_argument("--dir"); p.set_defaults(fn=cmd_init)
+    p = sub.add_parser("migrate"); p.add_argument("--dir"); p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--source", action="append", default=[], help="a memory directory to gather (repeatable); default: every <config>/projects/*/memory")
+    p.set_defaults(fn=cmd_migrate)
+    p = sub.add_parser("check"); p.add_argument("--dir"); p.set_defaults(fn=cmd_check)
+    p = sub.add_parser("status"); p.add_argument("--dir"); p.set_defaults(fn=cmd_status)
+    a = ap.parse_args(argv)
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
