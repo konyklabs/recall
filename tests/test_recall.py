@@ -208,6 +208,62 @@ class SourceRulesTests(Fixture):
         self.assertNotIn("[dev-moved]", out)
 
 
+class MountTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.run_cli("init", "--dir", str(self.target))
+        self.team = self.tmp / "teamrepo" / ".claude" / "memory"; self.team.mkdir(parents=True)
+        (self.team / "MEMORY.md").write_text("# Memory index\n\n- [t](t.md) — team fact\n")
+        (self.team / "t.md").write_text(mem("t", "team fact"))
+        self.user_md = self.cfg / "CLAUDE.md"
+        self.user_md.write_text("# Standing rules\n\nkeep me\n\n@" + str(self.team) + "/MEMORY.md\n")
+
+    def test_mount_writes_block_link_registry_and_removes_bare_duplicate(self):
+        code, out = self.run_cli("mount", str(self.team), "--dir", str(self.target))
+        self.assertEqual(code, 0, out)
+        self.assertIn("mounted teamrepo", out)
+        self.assertIn("removed a bare import line", out)
+        md = self.user_md.read_text()
+        self.assertIn("keep me", md)
+        self.assertEqual(md.count(f"@{self.team.resolve()}/MEMORY.md"), 1)
+        self.assertNotIn(f"@{self.team}/MEMORY.md\n#", md)  # the bare line is gone, only the block's import remains
+        self.assertIn(recall.MOUNT_START, md); self.assertIn(recall.MOUNT_END, md)
+        self.assertIn("written to that", md)
+        link = self.target / "mounts" / "teamrepo"
+        self.assertTrue(link.is_symlink()); self.assertEqual(os.readlink(link), str(self.team.resolve()))
+        self.assertIn("mounts/", (self.target / ".gitignore").read_text())
+        self.assertEqual(json.loads(recall.mounts_path().read_text()), {"teamrepo": str(self.team.resolve())})
+        self.assertIn("cost     3 lines", out)
+
+    def test_mount_is_idempotent_and_status_prints_cost(self):
+        self.run_cli("mount", str(self.team), "--dir", str(self.target))
+        before = self.user_md.read_text()
+        code, out = self.run_cli("mount", str(self.team), "--dir", str(self.target))
+        self.assertEqual(code, 0); self.assertEqual(self.user_md.read_text(), before)
+        code, out = self.run_cli("status", "--dir", str(self.target))
+        self.assertIn("mount         teamrepo:", out)
+        self.assertIn("mount cost    3 lines", out)
+
+    def test_check_covers_mounts_and_unmount_reverses(self):
+        self.run_cli("mount", str(self.team), "--dir", str(self.target))
+        code, out = self.run_cli("check", "--dir", str(self.target))
+        self.assertEqual(code, 0, out); self.assertIn("1 mounts, 0 errors", out)
+        (self.team / "MEMORY.md").unlink()
+        code, out = self.run_cli("check", "--dir", str(self.target))
+        self.assertEqual(code, 1); self.assertIn("mount teamrepo:", out)
+        (self.team / "MEMORY.md").write_text("# i\n")
+        code, out = self.run_cli("unmount", "teamrepo", "--dir", str(self.target))
+        self.assertEqual(code, 0, out)
+        md = self.user_md.read_text()
+        self.assertIn("keep me", md); self.assertNotIn("MEMORY.md", md); self.assertNotIn(recall.MOUNT_START, md)
+        self.assertFalse((self.target / "mounts" / "teamrepo").exists())
+        self.assertTrue((self.team / "t.md").exists())
+
+    def test_mount_refuses_a_directory_without_an_index(self):
+        code, out = self.run_cli("mount", str(self.tmp), "--dir", str(self.target))
+        self.assertEqual(code, 1); self.assertIn("has no MEMORY.md", out)
+
+
 class InitAndStatusTests(Fixture):
     def test_init_merges_one_key_and_keeps_the_rest(self):
         self.cfg.mkdir(parents=True, exist_ok=True)

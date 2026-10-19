@@ -10,7 +10,11 @@ Subcommands (stdlib only, Python 3.9+):
                          (<config>/projects/*/memory/) into DIR; originals untouched;
                          --dry-run prints the report and writes nothing
   check    [--dir DIR]   lint DIR: frontmatter, index <-> file agreement, load limit
-  status   [--dir DIR]   where memory resolves to, counts, git state
+  status   [--dir DIR]   where memory resolves to, counts, git state, mounts and their cost
+  mount    MEMDIR         make another repository's versioned memory index load in every
+                         session: an @import inside a block this kit owns in the user
+                         CLAUDE.md, a symlink under DIR/mounts/ for the vault, a write rule
+  unmount  NAME           the reverse
 
 DIR defaults to the autoMemoryDirectory in user settings, else ~/.claude/memory.
 Nothing here ever deletes or edits a source file. Memory content is never rewritten to
@@ -146,6 +150,141 @@ def generated_line(path: Path) -> str:
     title = fm.get("name") or path.stem
     desc = fm.get("description") or "(no description in frontmatter)"
     return f"- [{title}]({path.name}) — {desc}"
+
+
+# --------------------------------------------------------------------------- mounts
+
+MOUNT_START = "<!-- recall:mounts start (managed by recall; edit with recall mount / unmount) -->"
+MOUNT_END = "<!-- recall:mounts end -->"
+
+
+def user_claude_md() -> Path:
+    return config_dir() / "CLAUDE.md"
+
+
+def mounts_path() -> Path:
+    return config_dir() / "recall" / "mounts.json"
+
+
+def read_mounts() -> dict[str, str]:
+    p = mounts_path()
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8") or "{}")
+
+
+def write_mounts(m: dict[str, str]) -> None:
+    p = mounts_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(m, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def mount_block(m: dict[str, str]) -> str:
+    if not m:
+        return ""
+    lines = [MOUNT_START,
+             "## Mounted repository memories",
+             "",
+             "These repositories keep their own versioned memory. Their indexes are imported below so",
+             "they are in context in every session. A fact about one of them is written to that",
+             "repository's memory directory, never to the shared one.",
+             ""]
+    for name, d in sorted(m.items()):
+        lines.append(f"- {name}: {d}/")
+        lines.append(f"@{d}/MEMORY.md")
+    lines.append(MOUNT_END)
+    return "\n".join(lines) + "\n"
+
+
+def write_block(m: dict[str, str]) -> list[str]:
+    """Rewrite the managed block in the user CLAUDE.md (other text untouched). Also removes
+    bare `@<dir>/MEMORY.md` lines outside the block that duplicate a mount, and says so."""
+    p = user_claude_md()
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    notes = []
+    if MOUNT_START in text and MOUNT_END in text:
+        a = text.index(MOUNT_START); b = text.index(MOUNT_END) + len(MOUNT_END)
+        before, after = text[:a], text[b:].lstrip("\n")
+    else:
+        before, after = text, ""
+    imports = {str(Path(d).resolve() / "MEMORY.md") for d in m.values()}
+    kept = []
+    for ln in before.splitlines():
+        s = ln.strip()
+        if s.startswith("@") and str(Path(s[1:]).expanduser().resolve()) in imports:
+            notes.append(f"removed a bare import line outside the block (now inside it): {ln.strip()}")
+            continue
+        kept.append(ln)
+    before = "\n".join(kept).rstrip("\n")
+    block = mount_block(m)
+    new = (before + "\n\n" if before else "") + block + (("\n" + after) if after else "")
+    if not new.endswith("\n"):
+        new += "\n"
+    if new != text:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(new, encoding="utf-8")
+    return notes
+
+
+def cmd_mount(a: argparse.Namespace) -> int:
+    d = Path(a.memdir).expanduser().resolve()
+    if not (d / INDEX).is_file():
+        print(f"recall mount: {d} has no {INDEX}; point at a memory directory"); return 1
+    shared = resolve_dir(a.dir)
+    if d == shared:
+        print("recall mount: that is the shared directory itself"); return 1
+    name = a.name or (d.parent.parent.name if d.parent.name == ".claude" else d.name)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "mount"
+    m = read_mounts()
+    if name in m and m[name] != str(d):
+        print(f"recall mount: name {name!r} already points at {m[name]}; choose --name"); return 1
+    m[name] = str(d)
+    write_mounts(m)
+    notes = write_block(m)
+    link = shared / "mounts" / name
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        if link.is_symlink() and os.readlink(link) == str(d):
+            pass
+        else:
+            print(f"recall mount: {link} exists and is not a link to {d}; left alone")
+    else:
+        link.symlink_to(d, target_is_directory=True)
+    gi = shared / ".gitignore"
+    have = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    if "mounts/" not in have:
+        gi.write_text("\n".join(have + ["mounts/"]) + "\n", encoding="utf-8")
+    n_lines, n_bytes = index_size(d)
+    print(f"mounted {name}: {d}")
+    print(f"  import   @{d}/MEMORY.md in {user_claude_md()} (block of {len(m)} mount{'s' if len(m) != 1 else ''})")
+    print(f"  vault    {link} -> {d}")
+    print(f"  cost     {n_lines} lines, {n_bytes} bytes of index added to every session's context on this machine")
+    for n in notes:
+        print(f"  note     {n}")
+    print("  takes effect in the next session")
+    return 0
+
+
+def cmd_unmount(a: argparse.Namespace) -> int:
+    m = read_mounts()
+    if a.name not in m:
+        print(f"recall unmount: no mount named {a.name!r}; mounted: {', '.join(sorted(m)) or 'none'}"); return 1
+    d = m.pop(a.name)
+    write_mounts(m)
+    write_block(m)
+    link = resolve_dir(a.dir) / "mounts" / a.name
+    if link.is_symlink():
+        link.unlink()
+    print(f"unmounted {a.name}: {d} (its files are untouched; the import and the vault link are gone)")
+    return 0
+
+
+def index_size(d: Path) -> tuple[int, int]:
+    idx = d / INDEX
+    if not idx.exists():
+        return 0, 0
+    b = idx.read_bytes()
+    return len(b.splitlines()), len(b)
 
 
 # --------------------------------------------------------------------------- init
@@ -399,11 +538,23 @@ def cmd_check(a: argparse.Namespace) -> int:
             errors.append(f"{INDEX}: {n_lines} lines / {n_bytes} bytes exceeds the start-up load ({INDEX_LINE_LIMIT} / {INDEX_BYTE_LIMIT})")
         elif n_lines > 0.8 * INDEX_LINE_LIMIT or n_bytes > 0.8 * INDEX_BYTE_LIMIT:
             warnings.append(f"{INDEX}: {n_lines} lines / {n_bytes} bytes, past 80% of the start-up load")
+    m = read_mounts()
+    if m:
+        block_text = user_claude_md().read_text(encoding="utf-8") if user_claude_md().exists() else ""
+        for name, md in sorted(m.items()):
+            mp = Path(md)
+            if not (mp / INDEX).is_file():
+                errors.append(f"mount {name}: {mp}/{INDEX} is missing (unmount it, or restore the directory)")
+            if f"@{md}/MEMORY.md" not in block_text:
+                errors.append(f"mount {name}: its import line is not in {user_claude_md()} (run recall mount {md} again)")
+            link = d / "mounts" / name
+            if not link.is_symlink():
+                warnings.append(f"mount {name}: no vault link at {link} (run recall mount {md} again)")
     for e in errors:
         print(f"ERROR   {e}")
     for w in warnings:
         print(f"warning {w}")
-    print(f"recall check {d}: {len(files)} files, {len(errors)} errors, {len(warnings)} warnings")
+    print(f"recall check {d}: {len(files)} files, {len(m)} mounts, {len(errors)} errors, {len(warnings)} warnings")
     return 1 if errors else 0
 
 
@@ -428,6 +579,15 @@ def cmd_status(a: argparse.Namespace) -> int:
             print("git           not a repository (recall init makes it one)")
     srcs = [s for s in default_sources() if not s.is_symlink() and s.resolve() != d and memory_files(s)]
     print(f"per-project   {len(srcs)} director{'y' if len(srcs) == 1 else 'ies'} with files under {config_dir() / 'projects'}, symlinked ones excluded (recall migrate --dry-run says what is new)")
+    m = read_mounts()
+    if m:
+        total_l = total_b = 0
+        for name, md in sorted(m.items()):
+            l, b = index_size(Path(md)); total_l += l; total_b += b
+            print(f"mount         {name}: {md} ({l} lines, {b} bytes)")
+        print(f"mount cost    {total_l} lines, {total_b} bytes of imported index in every session on this machine")
+    else:
+        print("mounts        none (recall mount <repo>/.claude/memory makes a repository's own memory load everywhere)")
     print("note          a project-scope autoMemoryDirectory in a repository's .claude/settings.json overrides the user scope there")
     return 0
 
@@ -443,6 +603,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_migrate)
     p = sub.add_parser("check"); p.add_argument("--dir"); p.set_defaults(fn=cmd_check)
     p = sub.add_parser("status"); p.add_argument("--dir"); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("mount"); p.add_argument("memdir"); p.add_argument("--name"); p.add_argument("--dir"); p.set_defaults(fn=cmd_mount)
+    p = sub.add_parser("unmount"); p.add_argument("name"); p.add_argument("--dir"); p.set_defaults(fn=cmd_unmount)
     a = ap.parse_args(argv)
     return a.fn(a)
 

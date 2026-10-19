@@ -39,6 +39,11 @@ show.
    under ~/.claude/projects/*/memory/ are untouched and can be deleted by me later once I trust
    the shared directory.
 
+9. If any repository on this machine keeps its own versioned memory (a project-scope
+   `autoMemoryDirectory` in its `.claude/settings.json`), list them and, for each I confirm, run
+   `~/dev/recall/bin/recall mount <that memory directory>` so its index loads in every session.
+   Show `~/dev/recall/bin/recall status` after, including the mount cost line.
+
 Optional, only if I say yes when you ask at the end, as one question: install Obsidian
 (`brew install --cask obsidian` on macOS) and open ~/.claude/memory as a vault; and install the
 capture plugin with `claude plugin marketplace add konyklabs/claude-plugins` then

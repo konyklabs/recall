@@ -32,6 +32,16 @@ Verified against the Claude Code docs on 2026-10-19: https://code.claude.com/doc
     it never rewrites a memory to satisfy itself.
   - `recall status`: where memory resolves to, counts, git state, how many per-project
     directories exist (the dry run says what in them is new).
+  - `recall mount <repo>/.claude/memory`: a repository that keeps its own versioned memory
+    (a project-scope `autoMemoryDirectory`) is invisible to a session started anywhere else,
+    including a parent folder above several repositories. `mount` makes its index load in every
+    session on the machine: an `@import` by absolute path inside a block the kit owns in the
+    user-level `CLAUDE.md` (user-scope imports load without a dialog, from any directory), a
+    symlink under `<DIR>/mounts/` so the vault draws one graph, and a sentence telling sessions
+    that facts about that repository are written to its directory. `recall unmount <name>`
+    reverses it. `status` prints what the mounts cost per session; `check` covers them.
+    Measured 2026-10-19: a memory-only fact of a mounted repository was answered from a session
+    started in the parent folder and from an unrelated repository.
 - `docs/setup-prompt.md`: the paste-in prompt. A Claude Code session on a fresh machine runs the
   whole setup from it, dry run first.
 - `scripts/check.sh`: the repository's own check (tests, compile, actionlint when present).
@@ -62,6 +72,16 @@ Optional, after the above:
   files in this directory.
 - **A private remote:** `git remote add origin <your private repository>` in the memory directory
   carries it to a second machine. The kit never adds a remote.
+
+## Sitting above the repositories
+
+A session loads the memory of the directory it starts in and no other, and a repository's
+`.claude/settings.json` is never inherited by a parent. Rules are fine: a nested `CLAUDE.md`
+loads on demand once the session touches a file in it. Memory is not, and a pointer injected at
+start-up is seen but not followed (measured). `recall mount` is the answer: the repository's
+index is imported into every session. The cost is that every mount loads at every start, so
+mount what is in play this month; `recall status` shows the total. Writes from a parent-rooted
+session still go to the shared directory; the block's sentence is the mitigation, not a redirect.
 
 ## What it is not
 
