@@ -40,6 +40,7 @@ Verified against the Claude Code docs on 2026-10-19: https://code.claude.com/doc
 
 ```
 git clone https://github.com/konyklabs/recall ~/dev/recall
+mkdir -p ~/.local/bin && ln -sf ~/dev/recall/bin/recall ~/.local/bin/recall   # optional, if ~/.local/bin is on PATH
 ~/dev/recall/bin/recall init --dir ~/.claude/memory
 ~/dev/recall/bin/recall migrate --dry-run        # read the report
 ~/dev/recall/bin/recall migrate
