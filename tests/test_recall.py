@@ -176,6 +176,14 @@ class ReviewFindingsTests(Fixture):
         self.assertIn("odd.md: metadata.type is 'elsewhere'", out)
         self.assertIn("odd.md: not in MEMORY.md", out)
 
+    def test_top_level_type_is_the_earlier_format_and_passes(self):
+        self.target.mkdir()
+        (self.target / "old.md").write_text("---\nname: old\ndescription: earlier format\ntype: reference\n---\nbody\n")
+        (self.target / "MEMORY.md").write_text("# i\n\n- [old](old.md) — earlier format\n")
+        code, out = self.run_cli("check", "--dir", str(self.target))
+        self.assertEqual(code, 0, out)
+        self.assertIn("0 warnings", out)
+
     def test_check_flags_index_over_byte_limit(self):
         self.target.mkdir()
         (self.target / "a.md").write_text(mem("a", "x"))

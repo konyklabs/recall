@@ -111,6 +111,15 @@ def frontmatter(text: str) -> dict | None:
     return out
 
 
+def memory_type(fm: dict) -> str | None:
+    """`metadata.type` (the current auto-memory format) or a top-level `type:` (the earlier one)."""
+    meta = fm.get("metadata")
+    if isinstance(meta, dict) and meta.get("type"):
+        return meta["type"]
+    v = fm.get("type")
+    return v if isinstance(v, str) and v else None
+
+
 def memory_files(d: Path) -> list[Path]:
     return sorted(p for p in d.glob("*.md") if p.name != INDEX)
 
@@ -357,7 +366,7 @@ def cmd_check(a: argparse.Namespace) -> int:
         for key in ("name", "description"):
             if not fm.get(key):
                 errors.append(f"{f.name}: frontmatter lacks {key}")
-        t = (fm.get("metadata") or {}).get("type") if isinstance(fm.get("metadata"), dict) else None
+        t = memory_type(fm)
         if t not in TYPES:
             warnings.append(f"{f.name}: metadata.type is {t!r}, expected one of {sorted(TYPES)}")
         for m in WIKI_RE.finditer(text):
