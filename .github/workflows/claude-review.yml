@@ -1,11 +1,8 @@
 name: claude review
 
-# On demand, not on every push. The local lens round is the review (the
-# workspace's agentic-sdlc.md); this gate is a second, independent opinion a
-# change asks for by adding the `gate` label to its pull request -- and asks
-# for again, after a push, by removing and re-adding it. Measured before this
-# change: about 24 minutes and six Claude sessions per push
-# (konyklabs/roadmap#103).
+# On demand rather than on every push, to limit CI runtime and cost: add the
+# `gate` label to a pull request to request a review, and remove and re-add it
+# after a push to request another.
 on:
   pull_request:
     types: [labeled]
